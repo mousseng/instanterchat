@@ -17,6 +17,12 @@
 // part of every result goes through 09E090 with the floating number skipped, so only the chat line
 // comes out. The scheduler's own prints then run as they always did, but for results already let
 // out the chat line is dropped, so only the floating number comes out, on the animation's time.
+//
+// Scheduler opcode 0x80 clones the holder (18CEF0: new holder and list, results copied, then all
+// marked printed by 05E380) and hands the clone to another entity's effect (A8E30); its own 0x71
+// prints are how a skillchain's line comes out. A clone takes its source's results let out, and
+// any let out later. Clones are mostly freed by 18C620 without a release we see, so a holder is
+// known by its list (+0xC) as well, its address and the list's being taken again only together.
 // Every change to the client is the target of a call it already makes, or one branch made a jmp for
 // the length of our own calls; each is checked before it is made.
 
@@ -36,6 +42,8 @@
 #define RVA_RELEASE_SITE1 0x057537 // call 18CEA0, holder::Release(), as a scheduler is torn down
 #define RVA_RELEASE_SITE2 0x0A9684
 #define RVA_RELEASE       0x18CEA0
+#define RVA_CLONE_SITE    0x05BAD3 // call 18CEF0, holder::Clone(), scheduler opcode 0x80
+#define RVA_CLONE         0x18CEF0
 #define RVA_CHAT_SITE     0x09E35D // call AD660 in 09E090: the chat line
 #define RVA_CHAT          0x0AD660
 #define RVA_FLOAT_BRANCH  0x09E229 // jne 9E328 (0F 85 rel32): skips the floating number when taken
@@ -45,10 +53,12 @@
 
 typedef void(__thiscall* AttachFn)(void* scheduler, void* holder);
 typedef void(__thiscall* ReleaseFn)(void* holder);
+typedef void*(__thiscall* CloneFn)(void* holder);
 typedef void(__cdecl* FormatFn)(void* holder, int result, int part);
 typedef void(__cdecl* ChatFn)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static AttachFn GameAttach;
 static ReleaseFn GameRelease;
+static CloneFn GameClone;
 static FormatFn GameFormat;
 static ChatFn GameChat;
 static void** GameState;
@@ -59,6 +69,7 @@ static InstanterChat* Instance;
 
 static void __fastcall AttachHook(void* scheduler, void* edx, void* holder);
 static void __fastcall ReleaseHook(void* holder, void* edx);
+static void* __fastcall CloneHook(void* holder, void* edx);
 static void __cdecl FormatHook(void* holder, int result, int part);
 static void __cdecl ChatHook(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g)
 {
@@ -102,6 +113,7 @@ static const Site Sites[] = {
     { RVA_FORMAT_SITE2, RVA_FORMAT, (uintptr_t)FormatHook },
     { RVA_RELEASE_SITE1, RVA_RELEASE, (uintptr_t)ReleaseHook },
     { RVA_RELEASE_SITE2, RVA_RELEASE, (uintptr_t)ReleaseHook },
+    { RVA_CLONE_SITE, RVA_CLONE, (uintptr_t)CloneHook },
     { RVA_CHAT_SITE, RVA_CHAT, (uintptr_t)ChatHook },
 };
 #define SITES (int)(sizeof(Sites) / sizeof(Sites[0]))
@@ -118,6 +130,9 @@ class InstanterChat : public IPlugin {
     uint32_t m_PendingCount = 0;
     struct Released {
         void* holder;
+        void* list;
+        void* source; // the holder a clone was made from, whose results let out later are the clone's too
+        void* sourceList;
         uint64_t results;
     };
     Released m_Released[HOLDERS_MAX] = {};
@@ -135,13 +150,38 @@ class InstanterChat : public IPlugin {
     }
 
     static uint16_t& Refs(void* holder) { return *(uint16_t*)holder; }
+    static void* List(void* holder) { return *(void**)((uint8_t*)holder + 0xC); }
 
     Released* FindReleased(void* holder)
     {
+        void* list = List(holder);
+        if (!list)
+            return nullptr;
         for (uint32_t i = 0; i < HOLDERS_MAX; ++i)
-            if (m_Released[i].holder == holder)
+            if (m_Released[i].holder == holder && m_Released[i].list == list)
                 return &m_Released[i];
         return nullptr;
+    }
+
+    Released* AddReleased(void* holder, uint64_t results, void* source)
+    {
+        Released* r = &m_Released[m_ReleasedNext];
+        *r = { holder, List(holder), source, source ? List(source) : nullptr, results };
+        m_ReleasedNext = (m_ReleasedNext + 1) % HOLDERS_MAX;
+        return r;
+    }
+
+    // Results of a holder let out now are let out for its clones (and theirs) too
+    void PassToClones(void* holder, uint64_t results)
+    {
+        void* list = List(holder);
+        for (uint32_t i = 0; i < HOLDERS_MAX; ++i) {
+            Released& r = m_Released[i];
+            if (r.holder && r.source == holder && r.sourceList == list && (r.results | results) != r.results) {
+                r.results |= results;
+                PassToClones(r.holder, results);
+            }
+        }
     }
 
     // Lets out the chat lines of each pending holder whose scheduler still has it, and lets go of
@@ -175,12 +215,12 @@ class InstanterChat : public IPlugin {
                 }
                 SkipFloating(m_Base, false);
             }
-            if (results && known) {
+            if (results && known)
                 known->results |= results;
-            } else if (results) {
-                m_Released[m_ReleasedNext] = { holder, results };
-                m_ReleasedNext = (m_ReleasedNext + 1) % HOLDERS_MAX;
-            }
+            else if (results)
+                AddReleased(holder, results, nullptr);
+            if (results)
+                PassToClones(holder, results);
             OnRelease(holder);
         }
         m_PendingCount = 0;
@@ -221,7 +261,7 @@ public:
     const char* GetAuthor() const override { return "lin"; }
     const char* GetDescription() const override { return "Battle messages in the chat log when their packet arrives, not at the animation's hit."; }
     const char* GetLink() const override { return ""; }
-    double GetVersion() const override { return 1.0; }
+    double GetVersion() const override { return 1.1; }
     uint32_t GetFlags() const override
     {
         return (uint32_t)(Ashita::PluginFlags::UseCommands | Ashita::PluginFlags::UseDirect3D);
@@ -236,6 +276,7 @@ public:
             return false;
         GameAttach = (AttachFn)(m_Base + RVA_ATTACH);
         GameRelease = (ReleaseFn)(m_Base + RVA_RELEASE);
+        GameClone = (CloneFn)(m_Base + RVA_CLONE);
         GameFormat = (FormatFn)(m_Base + RVA_FORMAT);
         GameChat = (ChatFn)(m_Base + RVA_CHAT);
         GameState = (void**)(m_Base + RVA_GAME_STATE);
@@ -306,15 +347,27 @@ public:
     void OnRelease(void* holder)
     {
         const bool last = Refs(holder) == 1;
+        Released* r = last ? FindReleased(holder) : nullptr; // found while the list is still there
         GameRelease(holder);
-        if (last)
-            if (Released* r = FindReleased(holder))
-                r->holder = nullptr;
+        if (r)
+            r->holder = nullptr;
+    }
+
+    // A clone's scheduler prints are dropped for what its source has let out
+    void* OnClone(void* holder)
+    {
+        void* clone = GameClone(holder);
+        if (clone && List(clone)) {
+            const Released* r = FindReleased(holder);
+            AddReleased(clone, r ? r->results : 0, holder);
+        }
+        return clone;
     }
 };
 
 static void __fastcall AttachHook(void* scheduler, void*, void* holder) { Instance->OnAttach(scheduler, holder); }
 static void __fastcall ReleaseHook(void* holder, void*) { Instance->OnRelease(holder); }
+static void* __fastcall CloneHook(void* holder, void*) { return Instance->OnClone(holder); }
 static void __cdecl FormatHook(void* holder, int result, int part) { Instance->OnFormat(holder, result, part); }
 
 extern "C" {
